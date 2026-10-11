@@ -7,6 +7,9 @@ const client = new OpenAI({
   baseURL: process.env.LLM_BASE_URL || undefined,
 });
 
+const MODEL = process.env.LLM_MODEL || "gpt-4o-mini";
+const FALLBACK_REPLY = "Sorry, I didn't catch that. Could you please repeat it?";
+
 // Describes the tool to the LLM. The LLM reads this and decides when to call it.
 const tools = [
   {
@@ -38,24 +41,37 @@ export async function POST(request) {
     // Loop: the LLM may call a tool, we run it, then the LLM writes the final answer.
     for (let i = 0; i < 4; i++) {
       const res = await client.chat.completions.create({
-        model: process.env.LLM_MODEL || "gpt-4o-mini",
+        model: MODEL,
         messages: convo,
         tools,
         temperature: 0.3,
-        max_tokens: 200,
+        max_tokens: 1000, // reasoning models need room to think AND answer
+        // Keep the hidden thinking short so replies are fast (gpt-oss models only).
+        ...(MODEL.includes("gpt-oss") ? { reasoning_effort: "low" } : {}),
       });
 
       const msg = res.choices[0].message;
 
       // No tool requested: this is the final spoken reply.
       if (!msg.tool_calls || msg.tool_calls.length === 0) {
-        return Response.json({ reply: msg.content, toolsUsed });
+        const reply = (msg.content || "").trim();
+        return Response.json({ reply: reply || FALLBACK_REPLY, toolsUsed });
       }
 
-      // Tool requested: run it and give the result back to the LLM.
-      convo.push(msg);
+      // Tool requested: keep only the fields the API needs, then run the tool.
+      convo.push({
+        role: "assistant",
+        content: msg.content || "",
+        tool_calls: msg.tool_calls,
+      });
+
       for (const call of msg.tool_calls) {
-        const args = JSON.parse(call.function.arguments || "{}");
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || "{}");
+        } catch (e) {
+          args = {};
+        }
         const result = getOrderDetails(args.order_id);
         toolsUsed.push({ name: call.function.name, args, result });
         convo.push({
@@ -65,6 +81,7 @@ export async function POST(request) {
         });
       }
     }
+
     return Response.json({
       reply: "Sorry, I'm having trouble with that. Could you please try again?",
       toolsUsed,
