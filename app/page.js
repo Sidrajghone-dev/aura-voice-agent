@@ -3,6 +3,9 @@
 import { useState, useRef } from "react";
 import { ALL_ORDERS } from "../lib/orders";
 
+// Use "multi" instead for Hindi/English mixing (Hinglish).
+const STT_LANGUAGE = "en-IN";
+
 const STATES = {
   idle: { label: "Idle", dot: "bg-gray-400" },
   listening: { label: "Listening", dot: "bg-green-500" },
@@ -16,37 +19,176 @@ export default function Home() {
   const [agentState, setAgentState] = useState("idle");
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
+  const [interim, setInterim] = useState("");
+  const [error, setError] = useState("");
+
+  // Refs hold the latest values for callbacks (WebSocket handlers can't see fresh state).
   const callActiveRef = useRef(false);
+  const stateRef = useRef("idle");
+  const messagesRef = useRef([]);
+  const bufferRef = useRef("");
+  const wsRef = useRef(null);
+  const recorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const audioRef = useRef(null);
 
-  function startCall() {
-    callActiveRef.current = true;
-    setCallActive(true);
-    setCallEnded(false);
-    setMessages([
-      {
-        role: "assistant",
-        content: "Hi, this is Aria from Aura Skincare. How can I help you today?",
-      },
-    ]);
-    setAgentState("listening");
+  function setState(s) {
+    stateRef.current = s;
+    setAgentState(s);
   }
 
-  function endCall() {
-    callActiveRef.current = false;
-    setCallActive(false);
-    setCallEnded(true);
-    setAgentState("idle");
+  function updateMessages(m) {
+    messagesRef.current = m;
+    setMessages(m);
   }
 
-  async function sendMessage() {
-    const text = input.trim();
-    if (!text || agentState !== "listening") return;
+  // ---------- Mic + Deepgram ----------
 
-    const updated = [...messages, { role: "user", content: text }];
-    setMessages(updated);
-    setInput("");
-    setAgentState("thinking");
+  async function startMic() {
+    // 1. Get a short-lived token from our server.
+    const tokenRes = await fetch("/api/deepgram-token", { method: "POST" });
+    const tokenData = await tokenRes.json();
+    if (!tokenData.token) throw new Error(tokenData.error || "No Deepgram token");
 
+    // 2. Ask the browser for microphone access.
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+    streamRef.current = stream;
+
+    // 3. Open a live connection to Deepgram.
+    const params = new URLSearchParams({
+      model: "nova-3",
+      language: STT_LANGUAGE,
+      smart_format: "true",
+      interim_results: "true",
+      endpointing: "400", // ms of silence that marks the end of a sentence
+      utterance_end_ms: "1000", // backup signal for end of speech
+    });
+    const ws = new WebSocket(
+      `wss://api.deepgram.com/v1/listen?${params.toString()}`,
+         [tokenData.raw ? "token" : "bearer", tokenData.token]
+    );
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      // 4. Send mic audio to Deepgram in small chunks (every 250 ms).
+      const recorder = new MediaRecorder(stream);
+      recorderRef.current = recorder;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0 && ws.readyState === WebSocket.OPEN) ws.send(e.data);
+      };
+      recorder.start(250);
+    };
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+
+      if (data.type === "Results") {
+        const text = data.channel?.alternatives?.[0]?.transcript || "";
+        if (data.is_final) {
+          // A finished chunk of speech. Collect it until the speaker pauses.
+          if (text) {
+            bufferRef.current += (bufferRef.current ? " " : "") + text;
+          }
+          setInterim("");
+          if (data.speech_final) flushBuffer();
+        } else if (stateRef.current === "listening") {
+          // Live partial text while the customer is still talking.
+          setInterim((bufferRef.current + " " + text).trim());
+        }
+      } else if (data.type === "UtteranceEnd") {
+        flushBuffer();
+      }
+    };
+
+    ws.onerror = () => setError("Connection to speech service failed.");
+    ws.onclose = () => {
+      if (callActiveRef.current) setError("Speech connection closed. End the call and start again.");
+    };
+  }
+
+  function stopMic() {
+    try {
+      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+        recorderRef.current.stop();
+      }
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: "CloseStream" }));
+        wsRef.current.close();
+      }
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    } catch (e) {
+      console.error(e);
+    }
+    recorderRef.current = null;
+    wsRef.current = null;
+    streamRef.current = null;
+    bufferRef.current = "";
+    setInterim("");
+  }
+
+  // Called when the customer has finished a sentence.
+  function flushBuffer() {
+    const text = bufferRef.current.trim();
+    bufferRef.current = "";
+    setInterim("");
+    if (!text) return;
+    // Phase 10: ignore speech while Aria is busy. Phase 13 adds proper interruption.
+    if (stateRef.current !== "listening") return;
+    handleUserText(text);
+  }
+
+
+    // ---------- Speaking ----------
+
+  function speakWithBrowser(text) {
+    return new Promise((resolve) => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "en-IN";
+      u.onend = resolve;
+      u.onerror = resolve;
+      window.speechSynthesis.speak(u);
+    });
+  }
+
+  // Plays Aria's reply and resolves when the audio finishes.
+  async function speak(text) {
+    try {
+      const res = await fetch("/api/tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error("TTS request failed");
+      const blob = await res.blob();
+      if (!callActiveRef.current) return;
+
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      await new Promise((resolve) => {
+        audio.onended = resolve;
+        audio.onerror = resolve;
+        audio.play().catch(resolve);
+      });
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Falling back to browser voice:", err);
+      if (callActiveRef.current) await speakWithBrowser(text);
+    }
+  }
+
+  // ---------- Conversation ----------
+
+    async function handleUserText(text) {
+    const updated = [...messagesRef.current, { role: "user", content: text }];
+    updateMessages(updated);
+    setState("thinking");
+
+    let reply;
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -54,21 +196,74 @@ export default function Home() {
         body: JSON.stringify({ messages: updated }),
       });
       const data = await res.json();
-      if (!callActiveRef.current) return; // call was ended while thinking
-
-      setMessages([...updated, { role: "assistant", content: data.reply }]);
-      setAgentState("speaking");
-      // Placeholder: in Phase 11 this waits for the real audio to finish.
-      setTimeout(() => {
-        if (callActiveRef.current) setAgentState("listening");
-      }, 1000);
+      reply = data.reply;
     } catch (err) {
-      setMessages([
-        ...updated,
-        { role: "assistant", content: "Sorry, something went wrong. Please try again." },
-      ]);
-      setAgentState("listening");
+      reply = "Sorry, something went wrong. Please try again.";
     }
+    if (!callActiveRef.current) return; // call ended while thinking
+
+    updateMessages([...updated, { role: "assistant", content: reply }]);
+    setState("speaking");
+    await speak(reply);
+
+    if (callActiveRef.current) {
+      bufferRef.current = ""; // drop anything the mic picked up while Aria spoke
+      setInterim("");
+      setState("listening");
+    }
+  }
+
+    async function startCall() {
+    setError("");
+    callActiveRef.current = true;
+    setCallActive(true);
+    setCallEnded(false);
+
+    const greeting = "Hi, this is Aria from Aura Skincare. How can I help you today?";
+    updateMessages([{ role: "assistant", content: greeting }]);
+    setState("speaking");
+
+    // Start the greeting right away (inside the click, so Chrome allows audio),
+    // and set up the microphone while it plays.
+    const greetingDone = speak(greeting);
+
+    try {
+      await startMic();
+    } catch (err) {
+      console.error(err);
+      setError(
+        "Could not start the microphone: " +
+          (err.message || "unknown error") +
+          ". You can still type below."
+      );
+    }
+
+    await greetingDone;
+    if (callActiveRef.current) {
+      bufferRef.current = "";
+      setState("listening");
+    }
+  }
+
+    function endCall() {
+    callActiveRef.current = false;
+    stopMic();
+    window.speechSynthesis.cancel();
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.dispatchEvent(new Event("ended"));
+      audioRef.current = null;
+    }
+    setCallActive(false);
+    setCallEnded(true);
+    setState("idle");
+  }
+
+  function sendTyped() {
+    const text = input.trim();
+    if (!text || stateRef.current !== "listening") return;
+    setInput("");
+    handleUserText(text);
   }
 
   const s = STATES[agentState];
@@ -103,31 +298,35 @@ export default function Home() {
               )}
             </div>
 
+            {error && (
+              <div className="mt-3 p-2 rounded bg-red-50 text-red-700 text-sm">{error}</div>
+            )}
+
             <div className="mt-4 h-80 overflow-y-auto border rounded-lg p-3 space-y-2 bg-gray-50">
               {messages.length === 0 && (
-                <p className="text-gray-500 text-sm">
-                  Click Start Call to begin.
-                </p>
+                <p className="text-gray-500 text-sm">Click Start Call to begin.</p>
               )}
               {messages.map((m, i) => (
-                <div
-                  key={i}
-                  className={m.role === "user" ? "text-right" : "text-left"}
-                >
+                <div key={i} className={m.role === "user" ? "text-right" : "text-left"}>
                   <span className="text-xs text-gray-500 block">
                     {m.role === "user" ? "Customer" : "Aria"}
                   </span>
                   <span
                     className={`inline-block px-3 py-2 rounded-lg ${
-                      m.role === "user"
-                        ? "bg-blue-600 text-white"
-                        : "bg-white border"
+                      m.role === "user" ? "bg-blue-600 text-white" : "bg-white border"
                     }`}
                   >
                     {m.content}
                   </span>
                 </div>
               ))}
+              {interim && (
+                <div className="text-right">
+                  <span className="inline-block px-3 py-2 rounded-lg bg-blue-200 text-blue-900 italic">
+                    {interim}
+                  </span>
+                </div>
+              )}
             </div>
 
             {callActive && (
@@ -135,12 +334,12 @@ export default function Home() {
                 <input
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && sendMessage()}
-                  placeholder="Type what the customer says (temporary, until voice is added)"
+                  onKeyDown={(e) => e.key === "Enter" && sendTyped()}
+                  placeholder="Or type here (fallback for testing)"
                   className="flex-1 border rounded-lg px-3 py-2"
                 />
                 <button
-                  onClick={sendMessage}
+                  onClick={sendTyped}
                   disabled={agentState !== "listening"}
                   className="bg-gray-900 text-white px-4 py-2 rounded-lg disabled:opacity-40"
                 >
@@ -159,9 +358,7 @@ export default function Home() {
           {/* Test orders helper */}
           <aside className="bg-white rounded-xl shadow p-5">
             <h2 className="font-semibold">Test Orders</h2>
-            <p className="text-sm text-gray-500">
-              Use these IDs to test order lookups.
-            </p>
+            <p className="text-sm text-gray-500">Use these IDs to test order lookups.</p>
             <div className="mt-3 space-y-3">
               {ALL_ORDERS.map((o) => (
                 <div key={o.order_id} className="border rounded-lg p-3 text-sm">

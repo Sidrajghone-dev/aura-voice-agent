@@ -2,7 +2,10 @@ import OpenAI from "openai";
 import { SYSTEM_PROMPT } from "../../../lib/prompt";
 import { getOrderDetails } from "../../../lib/orders";
 
-const client = new OpenAI({ apiKey: process.env.LLM_API_KEY });
+const client = new OpenAI({
+  apiKey: process.env.LLM_API_KEY,
+  baseURL: process.env.LLM_BASE_URL || undefined,
+});
 
 // Describes the tool to the LLM. The LLM reads this and decides when to call it.
 const tools = [
@@ -35,7 +38,7 @@ export async function POST(request) {
     // Loop: the LLM may call a tool, we run it, then the LLM writes the final answer.
     for (let i = 0; i < 4; i++) {
       const res = await client.chat.completions.create({
-        model: "gpt-4o-mini",
+        model: process.env.LLM_MODEL || "gpt-4o-mini",
         messages: convo,
         tools,
         temperature: 0.3,
