@@ -93,6 +93,8 @@ export default function Home() {
   const streamRef = useRef(null);
   const audioRef = useRef(null);
   const chatBoxRef = useRef(null);
+  const confRef = useRef([]);
+  const lastUnclearRef = useRef(0);
 
   function setState(s) {
     stateRef.current = s;
@@ -157,24 +159,27 @@ export default function Home() {
       recorder.start(250);
     };
 
-    ws.onmessage = (e) => {
+        ws.onmessage = (e) => {
       const data = JSON.parse(e.data);
 
       if (data.type === "Results") {
-        const text = data.channel?.alternatives?.[0]?.transcript || "";
+        const alt = data.channel?.alternatives?.[0];
+        const text = alt?.transcript || "";
         if (data.is_final) {
           // A finished chunk of speech. Collect it until the speaker pauses.
           if (text) {
             bufferRef.current += (bufferRef.current ? " " : "") + text;
+            if (typeof alt.confidence === "number") confRef.current.push(alt.confidence);
           }
           setInterim("");
-          if (data.speech_final) flushBuffer();
+          // speech_final with no words means sound was heard but nothing was understood.
+          if (data.speech_final) flushBuffer(true);
         } else if (stateRef.current === "listening") {
           // Live partial text while the customer is still talking.
           setInterim((bufferRef.current + " " + text).trim());
         }
       } else if (data.type === "UtteranceEnd") {
-        flushBuffer();
+        flushBuffer(false);
       }
     };
 
@@ -206,15 +211,56 @@ export default function Home() {
     setInterim("");
   }
 
-  // Called when the customer has finished a sentence.
-  function flushBuffer() {
+    // Called when the customer has finished a sentence.
+  function flushBuffer(heardSoundButNoWords = false) {
     const text = bufferRef.current.trim();
+    const confs = confRef.current;
     bufferRef.current = "";
+    confRef.current = [];
     setInterim("");
-    if (!text) return;
+
     // Ignore speech while Aria is busy (barge-in is a later, optional phase).
     if (stateRef.current !== "listening") return;
+
+    if (!text) {
+      if (heardSoundButNoWords) handleUnclear("");
+      return;
+    }
+
+    const avg = confs.length ? confs.reduce((a, b) => a + b, 0) / confs.length : 1;
+    const letters = text.replace(/[^a-zA-Z\u0900-\u097F]/g, "");
+    console.log("heard:", text, "| confidence:", avg.toFixed(2)); // remove once tuned
+
+    // Low confidence, or almost no letters: treat it as unclear audio.
+    if (avg < 0.55 || letters.length < 2) {
+      handleUnclear(text);
+      return;
+    }
     handleUserText(text);
+  }
+
+  // Aria asks the customer to repeat, without calling the LLM.
+  async function handleUnclear(heardText) {
+    const now = Date.now();
+    if (now - lastUnclearRef.current < 8000) return; // avoid repeating it nonstop
+    lastUnclearRef.current = now;
+
+    const reply = "Sorry, I couldn't hear that clearly. Could you please repeat it?";
+    const updated = [
+      ...messagesRef.current,
+      { role: "user", content: heardText ? `[unclear audio: "${heardText}"]` : "[unclear audio]" },
+      { role: "assistant", content: reply },
+    ];
+    updateMessages(updated);
+    setState("speaking");
+    await speak(reply);
+
+    if (callActiveRef.current) {
+      bufferRef.current = "";
+      confRef.current = [];
+      setInterim("");
+      setState("listening");
+    }
   }
 
   // ---------- Speaking ----------
